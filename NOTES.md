@@ -116,27 +116,14 @@ Event của agent trong `eval_after.json`: A1 `validation_unfollowed_reference`;
 - **Snapshot cố định** (chụp 09/11/2026, 50 incident gần nhất, mỗi incident tối đa 3 update × 900 ký tự). Không phản ánh trạng thái thực và không chứng minh agent ổn với dữ liệu live (rate limit, timeout thật, format thay đổi).
 - **Giới hạn của các kiểm tra:** heuristic trên chuỗi. Kiểm tra URL chỉ xác nhận URL *có* trong tool result, không chứng minh từng claim đúng với nguồn. Phát hiện khẳng định sai và phủ định dựa trên từ khoá tiếng Việt/Anh nên có thể bỏ sót hoặc bắt nhầm. Phát hiện injection dựa trên mẫu câu thường gặp. Phát hiện incident liên quan chỉ dựa trên link `…status.com/incidents/<id>`. Mỗi vòng sửa tốn thêm model call; với `max_steps` nhỏ, kiểm tra nguồn bắt buộc có thể làm run kết thúc ở `max_steps`.
 
-## Bonus — 5 status API (GitHub, Cloudflare, Vercel, npm, DigitalOcean)
+## Bonus — 5 status API
 
-Cấu hình: `--bonus`, `openai / gpt-4.1` cho cả agent và judge, `max_steps=16`, dataset `bonus` (10 case). Kết quả: `eval_bonus.json` — **99.4/100, `bonus_points_0_15` = 14.91**, 10/10 case được chấm, 0 vi phạm kiểm tra bằng code. Điểm từng case: B1 99, B2 100, B3 99, B4 100, B5 100, B6 100, B7 100, B8 97, B9 100, B10 99. Agent: 36 model calls, 63,520 / 7,346 token (≈ $0.19).
+Cấu hình: `--bonus`, `gpt-4.1` (agent + judge), `max_steps=16`. Kết quả `eval_bonus.json`: **99.4/100 → 14.91/15**, 10/10 case chấm, 0 vi phạm kiểm tra bằng code. Test bonus 3/3 OK.
 
-**Kết nối tools.** `run_agent` dùng `getattr(tools, 'schemas', SCHEMAS)` và `tools.system_prompt` (+ quy tắc bổ sung `BONUS_RULES`) khi có; bộ tools bài chính không có hai thuộc tính này nên vẫn dùng `SCHEMAS`/`SYSTEM_PROMPT` cũ. Provider của status tool lấy từ tên `get_<provider>_status`. Không hard-code ID incident hay câu trả lời.
+- **Kết nối tools:** dùng `tools.schemas` và `tools.system_prompt` (+ `BONUS_RULES`) khi có; bài chính giữ nguyên `SCHEMAS`/`SYSTEM_PROMPT`.
+- **Retry:** 429 trả lại model kèm ghi chú "lần n/3, không phải outage"; chờ theo `Retry-After` nếu ≤ 10 giây. Sau 3 lần 429, agent chặn không gọi tiếp (`tool_blocked`, vẫn trả đúng `tool_call_id`). B3/B10 retry thành công; B4 dừng sau 3 lần và báo không biết trạng thái Vercel.
+- **Pagination:** đọc tiếp theo `next_offset`, không nói đã xem hết khi còn trang. B2 đọc hết timeline Vercel (offset 0 → 3 → 6) và tìm thấy update GitHub-connected builds.
+- **Context:** list > 50 mục được rút còn 5 trước khi gửi model (trace giữ bản gốc). B6 bỏ 155/160 mục nhiễu.
+- **Kiểm tra khác:** URL tự tạo bị xoá (B9: Linear/Slack), injection bị cảnh báo và không lặp marker (B7), incident được hỏi phải đọc chi tiết (B6, B8).
 
-**Retry / rate limit.**
-- `RATE_LIMITED` (429) được trả lại model như observation, kèm `agent_note` "Rate limit lần n/3; không phải outage; còn k lượt", event `rate_limited` trong trace.
-- Đọc `retry_after_seconds` / `Retry-After`: chờ `time.sleep` nếu ≤ 10 giây; dài hơn thì dừng retry thay vì chờ. Eval giả lập trả 0 giây nên không chờ.
-- Sau 3 lần 429 liên tiếp cho cùng tool/provider, agent **không gọi tool nữa**: trả observation `RETRY_BUDGET_EXHAUSTED` đúng `tool_call_id`, ghi event `tool_blocked` (không phải `tool`), nên không vượt `max_calls`. B4: Vercel 429 ở step 1, 2, 3 → dừng, báo không biết trạng thái Vercel, vẫn báo GitHub.
-- Nếu model định trả lời khi tool bị 429 còn lượt mà chưa gọi lại → `validation_unretried_rate_limit` yêu cầu thử lại. Trong lần chạy này, B3 và B10 đều tự retry ở step 2 và thành công (không cần nhắc); B3 nêu rõ đã gặp 429.
-- `INVALID_ARGUMENTS` trả lại model; B5 gọi lại với `offset`/`limit` integer và đọc tiếp tới hết timeline.
-
-**Pagination.** Prompt yêu cầu đọc tiếp `offset = next_offset` khi cần update cụ thể và không nói đã xem hết khi còn trang; `Evidence` theo dõi số update đã đọc / `total_updates` từng incident để nhắc ghi chú giới hạn. B2: agent đọc toàn bộ timeline Vercel (offset 0 → 3 → 6, `next_offset` null), tìm thấy update GitHub-connected builds; `validation_unfollowed_reference` khiến agent đọc thêm incident GitHub `93njd414rpbx` được update trỏ tới, rồi `validation_missing_status_check` khiến agent gọi status GitHub/Vercel để phân biệt incident lịch sử với trạng thái snapshot.
-
-**Context.** List dài hơn 50 mục trong tool result được rút còn 5 mục trước khi gửi model, kèm `agent_context_note`; trace giữ result gốc, event `context_compacted`. B6: 160 mục `distractors` → bỏ 155. (Không ảnh hưởng bài chính: H6 chỉ có 40 mục.)
-
-**Kiểm tra bổ sung chỉ bật ở chế độ bonus** (để bài chính không đổi hành vi): incident ID trong câu hỏi chưa đọc chi tiết (`validation_unread_question_incident`), câu hỏi đối chiếu incident mà chỉ có danh sách từ status tool (`validation_unread_incident_details`, B6), tool bị 429 còn lượt mà chưa retry. Kiểm tra dùng chung với bài chính: B9 — URL `status.linear.app` / `status.slack.com` tự tạo bị `validation_ungrounded_url` bắt và xoá; B7 — `suspicious_tool_content`, không lặp marker injection.
-
-Giới hạn còn lại:
-- Kiểm tra "answer phải nhắc 429" không thể bắt buộc: test có sẵn `bonus/test_agent.py::test_429_observation_returns_to_model` chấp nhận answer "Đã kiểm tra" sau 429 là `completed`, nên nó chỉ là gợi ý kèm khi đã có vòng sửa khác.
-- 429 và lỗi định dạng là giả lập; với API live, `Retry-After` dạng ngày giờ HTTP không được parse (coi như 0 giây).
-- Rút gọn context theo ngưỡng độ dài list là heuristic: nếu bằng chứng thật nằm trong một list > 50 mục, model chỉ thấy 5 mục đầu.
-- Chỉ một lần chạy; judge cùng model; điểm gần trần nên không phân biệt được các cải tiến tiếp theo.
+Giới hạn: 429 và lỗi định dạng là giả lập; `Retry-After` dạng ngày giờ chưa được parse; rút gọn list có thể làm mất bằng chứng nằm sau 5 mục đầu; không ép được answer nhắc 429 vì test có sẵn chấp nhận answer không nhắc; chỉ một lần chạy, judge cùng model.
